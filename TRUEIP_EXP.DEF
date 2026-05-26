@@ -1,0 +1,3 @@
+LIBRARY TRUEIP.DLL
+EXPORTS
+    _init__trueip=init__trueip   @1

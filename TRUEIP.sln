@@ -1,0 +1,28 @@
+
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "TRUEIP", "TRUEIP.vcxproj", "{EA307BA4-AF91-48EC-82FB-460E0AD4BF46}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Win32 = Debug|Win32
+		Debug|x64 = Debug|x64
+		Release|Win32 = Release|Win32
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{EA307BA4-AF91-48EC-82FB-460E0AD4BF46}.Debug|Win32.ActiveCfg = Debug|Win32
+		{EA307BA4-AF91-48EC-82FB-460E0AD4BF46}.Debug|Win32.Build.0 = Debug|Win32
+		{EA307BA4-AF91-48EC-82FB-460E0AD4BF46}.Debug|x64.ActiveCfg = Debug|x64
+		{EA307BA4-AF91-48EC-82FB-460E0AD4BF46}.Debug|x64.Build.0 = Debug|x64
+		{EA307BA4-AF91-48EC-82FB-460E0AD4BF46}.Release|Win32.ActiveCfg = Release|Win32
+		{EA307BA4-AF91-48EC-82FB-460E0AD4BF46}.Release|Win32.Build.0 = Release|Win32
+		{EA307BA4-AF91-48EC-82FB-460E0AD4BF46}.Release|x64.ActiveCfg = Release|x64
+		{EA307BA4-AF91-48EC-82FB-460E0AD4BF46}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal

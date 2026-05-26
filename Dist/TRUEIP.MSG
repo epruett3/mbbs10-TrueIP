@@ -1,0 +1,44 @@
+LEVEL4 {TRUEIP - Proxy Protocol Configuration}
+
+ TRUEIP adds PROXY Protocol v1 support so the BBS can see
+ real client IPs when behind a reverse proxy.
+
+TPORT {Proxy listener port 2324} N 1 65535
+
+ TCP port for PROXY-wrapped connections.
+
+REQHDR {Require PROXY header? YES} B
+
+ YES = reject connections without a valid PROXY header.
+
+TRUSTIP {Trusted proxy IPs (comma-sep) } S 64 Trusted IPs
+
+ IP addresses of your reverse proxy. Comma-separated.
+
+MAXRATE {Max connections/sec 10} N 0 999
+
+ Rate limit on proxy port. 0 = no limit.
+
+LOGEN {Enable debug file log? NO} B
+
+ Write detailed trace to TRUEIP.LOG.
+
+LOGMAX {Max log size (KB) 1024} (LOGEN=YES) N 0 99999
+
+ Log rotation threshold.
+
+LEVEL6 {TRUEIP - Messages}
+
+SPLASH {
+TRUEIP adds PROXY Protocol v1 support to MBBS10.
+Sysop commands: TRUEIP STATUS | TRUEIP WHO
+} T Module Splash
+
+WHOHDR {[0m[2J
+[1;36mUŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽ¨
+3 [1;33mTRUEIP [0;36m-- Active TCP/IP Connections                  [1;36m3
+AŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽ'
+3 [1;37mChan  [1;33mIP Address        [1;32mPort   [1;35mServer              [1;36m3
+AŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽU} T WHO Header
+
+WHOROW {[0;1m [37m%4d  [33m%-18s[32m%-7d[35m%-19s} T WHO Row

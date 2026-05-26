@@ -1,0 +1,44 @@
+# Build artifacts
+*.obj
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.exe
+*.map
+*.bak
+*.MCV
+*.user
+*.suo
+.vs/
+
+# VS intermediate dirs
+TRUEIP/
+GALTCPIP_CLONE/
+Debug/
+Release/
+
+# SDK (not ours)
+external/
+
+# Original source (not ours)
+docs/oldsrc/
+
+# Clone files (staying private)
+galtcpip_*.c
+galtcpip_*.h
+GALTCPIP_*
+build_clone.bat
+
+# Scratch scripts and logs
+_*.bat
+_*.c
+_*.txt
+build_out*.txt
+build_log*.txt
+build_result*.txt
+symbols_out.txt
+
+# Dist staging (zip is committed)
+Dist/TRUEIP-v1.0.0-alpha/

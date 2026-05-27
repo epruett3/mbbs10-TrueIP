@@ -137,6 +137,18 @@ static char              **g_pmargv              = NULL;
  * We allow 107 to match the spec's maximum (including TCP6 addresses). */
 #define PROXY_HEADER_MAX    107
 
+/* PROXY Protocol v2 — 12-byte binary magic signature.
+ * The spec defines this exact byte sequence; any other first byte rules out v2. */
+static const unsigned char PROXY_V2_MAGIC[12] = {
+    0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A
+};
+
+/* Maximum addr_len we will accept from a v2 header.
+ * The spec allows up to 65535 bytes of TLV extensions — pathological in practice.
+ * Real-world TLVs (PP2_TYPE_SSL, PP2_TYPE_AUTHORITY) are tens of bytes.
+ * Cap at 512 to prevent a malicious header from stalling the consume loop. */
+#define PROXY_V2_ADDR_LEN_CAP  512
+
 /* Maximum number of trusted proxy IPs we'll parse from the config string.
  * A BBS operator rarely has more than a handful of upstream proxies. */
 #define TRUSTED_IP_MAX      8
@@ -457,28 +469,225 @@ check_rate_limit(VOID)
 }
 
 /* ============================================================================
- * parse_proxy_v1() — read and parse the PROXY Protocol v1 header.
+ * parse_proxy_v2_payload() — parse a PROXY Protocol v2 binary header.
+ *
+ * Called by parse_proxy_header() after it has confirmed the first 12 bytes
+ * match PROXY_V2_MAGIC.  The full header has already been peek-buffered by
+ * the caller; this function reads fields from peeked[], then consumes the
+ * header bytes from the socket via recv() so tntincall gets a clean stream.
+ *
+ * PROXY v2 header layout (all multi-byte fields in network byte order):
+ *   Bytes  0-11  magic (already verified by caller)
+ *   Byte   12    upper nibble = version (must be 0x2)
+ *                lower nibble = command (0x0=LOCAL health-check, 0x1=PROXY)
+ *   Byte   13    upper nibble = family (0x1=AF_INET, 0x2=AF_INET6)
+ *                lower nibble = transport (0x1=TCP)
+ *   Bytes 14-15  addr_len (uint16, network byte order) — length of the
+ *                address block that follows byte 15.  For TCP4: 12 bytes
+ *                (src_addr+dst_addr+src_port+dst_port).  May be larger if
+ *                TLV extensions (PP2_TYPE_SSL, etc.) are appended.
+ *   Bytes 16+    address block:
+ *                  TCP4: src_addr[4] dst_addr[4] src_port[2] dst_port[2]
+ *                  TCP6: src_addr[16] dst_addr[16] src_port[2] dst_port[2]
+ *
+ * Total header = 16 + addr_len (28 bytes for a plain TCP4 header).
+ *
+ * PARAMETERS:
+ *   skt       — raw socket (clskt at incall time); used only for consume recv
+ *   peeked    — bytes returned by MSG_PEEK in the caller; must be >= 16 bytes
+ *   peek_len  — number of valid bytes in peeked[]
+ *   out_ip    — receives src_addr on success
+ *
+ * RETURNS:
+ *    1 = success, *out_ip filled with real client IP
+ *    0 = LOCAL command (health check) — no IP substitution
+ *   -1 = error (unknown command, unsupported family, incomplete header,
+ *               consume failed)
+ *
+ * ALL error and success paths log via trueip_log with a "v2" prefix so they
+ * are distinguishable from v1 log lines in TRUEIP.LOG / Event Log.
+ * ============================================================================*/
+static INT
+parse_proxy_v2_payload(INT skt, const char *peeked, INT peek_len, struct in_addr *out_ip)
+{
+    unsigned char   ver_cmd;    /* byte 12: version + command nibbles            */
+    unsigned char   fam_trn;    /* byte 13: family + transport nibbles           */
+    unsigned char   version;    /* upper nibble of byte 12 — must be 0x2        */
+    unsigned char   command;    /* lower nibble of byte 12 — LOCAL=0, PROXY=1   */
+    unsigned char   family;     /* upper nibble of byte 13 — AF_INET=1, INET6=2 */
+    unsigned char   transport;  /* lower nibble of byte 13 — TCP=1              */
+    unsigned short  addr_len_net; /* bytes 14-15 in network byte order          */
+    INT             addr_len;   /* addr_len converted to host byte order        */
+    INT             total;      /* full header size = 16 + addr_len             */
+    CHAR            discard[256]; /* stack consume buffer — never heap           */
+    INT             n;
+
+    /* Caller guarantees peek_len >= 12 (v2 magic matched).
+     * We need at least 16 bytes to read the full fixed header. */
+    if (peek_len < 16) {
+        trueip_log("TRUEIP v2: peek_len=%d < 16 — cannot read fixed header fields", peek_len);
+        return -1;
+    }
+
+    /* -- Byte 12: version (upper nibble) + command (lower nibble) --------- */
+    ver_cmd   = (unsigned char)peeked[12];
+    version   = (ver_cmd >> 4) & 0x0F;
+    command   = ver_cmd & 0x0F;
+
+    if (version != 0x2) {
+        trueip_log("TRUEIP v2: version nibble 0x%X != 0x2 — rejected", (unsigned)version);
+        return -1;
+    }
+
+    /* LOCAL (0x0): HAProxy health check.  Spec says consume the header and
+     * close or pass the connection.  We consume, then return 0 so the caller
+     * applies the g_require_header policy (typically: reject the connection). */
+    if (command == 0x0) {
+        /* We still need addr_len to know how many bytes to consume.
+         * Read bytes 14-15 via memcpy to avoid strict-aliasing UB. */
+        memcpy(&addr_len_net, peeked + 14, 2);
+        addr_len = (INT)ntohs(addr_len_net);
+        total    = 16 + addr_len;
+
+        trueip_log("TRUEIP v2: LOCAL command (health check) — consuming %d header bytes", total);
+
+        /* Consume in 256-byte chunks so we don't need a large stack buffer. */
+        while (total > 0) {
+            INT chunk = (total < (INT)sizeof(discard)) ? total : (INT)sizeof(discard);
+            n = recv(skt, discard, chunk, 0);
+            if (n <= 0) {
+                trueip_log("TRUEIP v2: LOCAL consume recv returned %d — connection broken", n);
+                return -1;
+            }
+            total -= n;
+        }
+        return 0;  /* health check — caller will apply require_header policy */
+    }
+
+    if (command != 0x1) {
+        trueip_log("TRUEIP v2: unknown command nibble 0x%X (expected 0x0=LOCAL or 0x1=PROXY)", (unsigned)command);
+        return -1;
+    }
+
+    /* -- Byte 13: family (upper nibble) + transport (lower nibble) -------- */
+    fam_trn   = (unsigned char)peeked[13];
+    family    = (fam_trn >> 4) & 0x0F;
+    transport = fam_trn & 0x0F;
+
+    /* Only TCP over IPv4 is supported.  IPv6 requires struct in6_addr and
+     * GALTCPIP's tcpipinf.inaddr is struct in_addr (32-bit only). */
+    if (family == 0x2) {
+        trueip_log("TRUEIP v2: TCP6 (AF_INET6) is not supported — rejected (tcpipinf.inaddr is 32-bit)");
+        return -1;
+    }
+
+    if (family != 0x1 || transport != 0x1) {
+        trueip_log("TRUEIP v2: unsupported family/transport (byte13=0x%02X) — only AF_INET/TCP (0x11) supported",
+                   (unsigned)fam_trn);
+        return -1;
+    }
+
+    /* -- Bytes 14-15: addr_len -------------------------------------------- */
+    /* WHY memcpy instead of *(unsigned short*)(peeked+14):
+     *   That cast is a strict-aliasing violation (reading char* memory as
+     *   unsigned short*).  Benign on MSVC/x86 in practice but undefined per
+     *   the C standard.  memcpy is equally fast after optimization and is
+     *   portable. */
+    memcpy(&addr_len_net, peeked + 14, 2);
+    addr_len = (INT)ntohs(addr_len_net);
+
+    /* Minimum addr_len for TCP4 is 12 bytes.  Not == 12 because TLV extensions
+     * make it larger while still being a valid TCP4 header. */
+    if (addr_len < 12) {
+        trueip_log("TRUEIP v2: addr_len=%d < 12 — malformed TCP4 address block", addr_len);
+        return -1;
+    }
+
+    /* Cap at 512 bytes.  The spec allows up to 65535 bytes of TLV extensions
+     * but real-world TLVs are tens of bytes.  A value > 512 indicates either
+     * a pathological extension or a malformed/malicious header. */
+    if (addr_len > PROXY_V2_ADDR_LEN_CAP) {
+        trueip_log("TRUEIP v2: addr_len=%d exceeds cap %d — rejected", addr_len, PROXY_V2_ADDR_LEN_CAP);
+        return -1;
+    }
+
+    /* -- Completeness check -----------------------------------------------
+     * We need at least 16 + addr_len peeked bytes to safely read src_addr.
+     * If TLV extensions push the header beyond what was peeked, return -1
+     * immediately.  No second retry loop — a real proxy sends the full header
+     * in one TCP segment on LAN.  Doubling the scheduler stall window is worse
+     * than rejecting the connection. */
+    total = 16 + addr_len;
+    if (peek_len < total) {
+        trueip_log("TRUEIP v2: header incomplete (have %d peeked, need %d) — rejected", peek_len, total);
+        return -1;
+    }
+
+    /* -- Extract src_addr (bytes 16-19) -----------------------------------
+     * The address block starts at byte 16.  For TCP4 it is:
+     *   src_addr[4] dst_addr[4] src_port[2] dst_port[2]
+     * src_addr is already in network byte order — copy directly to out_ip.
+     * peeked+16 through peeked+19 are valid because peek_len >= total >= 28. */
+    memcpy(out_ip, peeked + 16, 4);
+
+    /* -- Consume the full header from the socket --------------------------
+     * MSG_PEEK did NOT consume the bytes.  We must consume the entire header
+     * (16 + addr_len bytes) before returning so tntincall sees a clean stream.
+     * Use a 256-byte stack buffer in a loop to avoid large stack allocations. */
+    while (total > 0) {
+        INT chunk = (total < (INT)sizeof(discard)) ? total : (INT)sizeof(discard);
+        n = recv(skt, discard, chunk, 0);
+        if (n <= 0) {
+            /* Incomplete consume means tntincall would see binary garbage.
+             * This is fatal — return -1 so the caller closes the socket. */
+            trueip_log("TRUEIP v2: consume recv returned %d after reading %d remaining bytes — connection broken",
+                       n, total);
+            return -1;
+        }
+        total -= n;
+    }
+
+    {
+        /* Log the parsed IP using %u.%u.%u.%u byte expansion.
+         * WHY NOT inet_ntoa: returns a static buffer — two calls in one log
+         * statement produce undefined results (second overwrites first). */
+        unsigned char *b = (unsigned char *)&out_ip->s_addr;
+        trueip_log("TRUEIP v2: parsed real client IP: %u.%u.%u.%u (addr_len=%d)",
+                   b[0], b[1], b[2], b[3], 16 + addr_len);
+    }
+
+    return 1;  /* success — *out_ip is valid */
+}
+
+/* ============================================================================
+ * parse_proxy_header() — detect and parse a PROXY Protocol header (v1 or v2).
+ *
+ * This is the top-level dispatcher.  It peeks at the incoming bytes and routes:
+ *   - First 12 bytes match PROXY_V2_MAGIC → parse_proxy_v2_payload()
+ *   - First 6 bytes are "PROXY "          → v1 text parsing (below)
+ *   - Neither                             → return 0 (direct connection)
  *
  * PROXY v1 format (text, single line terminated by \r\n):
  *   "PROXY TCP4 <src-ip> <dst-ip> <src-port> <dst-port>\r\n"
  *   "PROXY LOCAL\r\n"                     (health check — no IP substitution)
  *
- * ALGORITHM:
- *   1. recvbw() preflight — if < 6 bytes waiting, reject immediately.
- *      The proxy is on the LAN; if the header isn't in the kernel buffer when
- *      incall() fires, something is wrong.  NO select/blocking wait — the BBS
- *      scheduler is single-threaded and cannot tolerate blocking in incall().
- *   2. Byte-at-a-time recv until \r\n (max PROXY_HEADER_MAX bytes).
- *      Since recvbw confirmed data is present, these reads return immediately
- *      from the kernel buffer.  Byte-at-a-time avoids consuming post-header
- *      telnet bytes that GALTNTD needs to read.
- *   3. Validate "PROXY " prefix.
- *   4. sscanf parse — must return exactly 5 fields.
- *   5. Check proto: "LOCAL" → return 0 (health check).
+ * ALGORITHM (v1 path):
+ *   1. FIONREAD preflight — wait up to 20ms for >= 16 bytes in kernel buffer.
+ *      16 bytes is the minimum to distinguish v2 (needs 16) from v1 (>= 14).
+ *      NO select/blocking wait beyond the short retry loop — the BBS scheduler
+ *      is single-threaded and cannot tolerate blocking in incall().
+ *   2. MSG_PEEK — inspect bytes without consuming.  CRITICAL: direct connections
+ *      (require_header=NO) must not have their IAC negotiation consumed.
+ *   3. v2 magic check — dispatch to parse_proxy_v2_payload() if matched.
+ *   4. "PROXY " prefix check — return 0 if not matched (direct connection).
+ *   5. Find \r\n terminator within the peeked data.
+ *   6. Consume exactly the header bytes (up to and including \r\n).
+ *   7. sscanf parse — must return exactly 5 fields for TCP4.
+ *   8. Check proto: "LOCAL" → return 0 (health check).
  *                   "TCP4"  → proceed.
  *                   other   → return -1 (unsupported, e.g. TCP6).
- *   6. Strip "::ffff:" prefix (Node.js dual-stack sends IPv4-mapped IPv6).
- *   7. inet_addr conversion — INADDR_NONE means malformed.
+ *   9. Strip "::ffff:" prefix (Node.js dual-stack sends IPv4-mapped IPv6).
+ *  10. inet_addr conversion — INADDR_NONE means malformed.
  *
  * PARAMETERS:
  *   skt       — the raw socket (clskt value at incall time)
@@ -490,7 +699,7 @@ check_rate_limit(VOID)
  *   -1 = malformed / unsupported / recv error
  * ============================================================================*/
 static INT
-parse_proxy_v1(INT skt, struct in_addr *out_ip)
+parse_proxy_header(INT skt, struct in_addr *out_ip)
 {
     CHAR    hdr[PROXY_HEADER_MAX + 1];
     INT     hdr_len    = 0;
@@ -520,18 +729,18 @@ parse_proxy_v1(INT skt, struct in_addr *out_ip)
         for (retry = 0; retry < 20; retry++) {
             ioctlsocket(skt, FIONREAD, &ul_avail);
             avail = (INT)ul_avail;
-            if (avail >= 6) break;
+            if (avail >= 16) break;
             Sleep(1);
         }
-        if (retry > 0 && avail >= 6) {
+        if (retry > 0 && avail >= 16) {
             trueip_log("TRUEIP: preflight needed %d ms to see %d bytes", retry, avail);
         }
         INT peek_n;
         INT hdr_end = -1;
         INT i;
 
-        if (avail < 6) {
-            trueip_log("TRUEIP: recvbw=%d < 6 on socket %d — no PROXY header in buffer", avail, skt);
+        if (avail < 16) {
+            trueip_log("TRUEIP: recvbw=%d < 16 on socket %d — no PROXY header in buffer", avail, skt);
             return -1;
         }
 
@@ -548,7 +757,18 @@ parse_proxy_v1(INT skt, struct in_addr *out_ip)
         }
         hdr[peek_n] = '\0';
 
-        /* -- Step 3: validate "PROXY " prefix without consuming -----------
+        /* -- Step 3: detect PROXY v2 binary header ----------------------------
+         * v2 is identified by a 12-byte magic signature.  If the first 12 bytes
+         * match, dispatch to the v2 parser immediately — it reads family, command,
+         * addr_len, extracts src_addr, and consumes the full header from the socket.
+         * The v2 check MUST precede the v1 strncmp because the v2 magic begins with
+         * \r\n bytes that would not match "PROXY " anyway, but being explicit avoids
+         * any ambiguity in edge cases. */
+        if (peek_n >= 12 && memcmp(hdr, PROXY_V2_MAGIC, 12) == 0) {
+            return parse_proxy_v2_payload(skt, hdr, peek_n, out_ip);
+        }
+
+        /* -- Step 4: validate "PROXY " prefix without consuming -----------
          * If the first 6 bytes are NOT "PROXY ", this is a direct connection.
          * Return 0 with ZERO bytes consumed — tntincall gets the full stream. */
         if (strncmp(hdr, "PROXY ", 6) != 0) {
@@ -556,7 +776,7 @@ parse_proxy_v1(INT skt, struct in_addr *out_ip)
             return 0;
         }
 
-        /* -- Step 4: find \r\n in peeked data -----------------------------
+        /* -- Step 5: find \r\n in peeked data -----------------------------
          * The PROXY header must end with \r\n within the peeked bytes.
          * If \r\n is not found, the header is incomplete (partial TCP delivery). */
         for (i = 0; i < peek_n - 1; i++) {
@@ -570,7 +790,7 @@ parse_proxy_v1(INT skt, struct in_addr *out_ip)
             return -1;
         }
 
-        /* -- Step 5: consume exactly the header ---------------------------
+        /* -- Step 6: consume exactly the header ---------------------------
          * Now that we KNOW a complete PROXY header is in the buffer, consume
          * exactly hdr_end bytes.  Everything after \r\n stays in the buffer
          * for tntincall's telnet negotiation. */
@@ -582,14 +802,14 @@ parse_proxy_v1(INT skt, struct in_addr *out_ip)
         hdr[hdr_len] = '\0';
     }
 
-    /* -- Step 4: sscanf parse ------------------------------------------
+    /* -- Step 7: sscanf parse ------------------------------------------
      * "PROXY %15s %63s %63s %d %d"
      * Fields: proto, src_ip, dst_ip, src_port, dst_port.
      * Must return exactly 5 for TCP4; fewer fields means LOCAL or malformed. */
     fields = sscanf(hdr, "PROXY %15s %63s %63s %d %d",
                     proto, src_ip, dst_ip, &src_port, &dst_port);
 
-    /* -- Step 5: check protocol field ------------------------------------*/
+    /* -- Step 8: check protocol field ------------------------------------*/
     if (fields == 1 && strncmp(proto, "LOCAL", 5) == 0) {
         /* PROXY LOCAL is a HAProxy health-check connection.  The spec says
          * we should not perform IP substitution — treat it as a direct
@@ -611,7 +831,7 @@ parse_proxy_v1(INT skt, struct in_addr *out_ip)
         return -1;
     }
 
-    /* -- Step 6: strip ::ffff: prefix ------------------------------------
+    /* -- Step 9: strip ::ffff: prefix ------------------------------------
      * Node.js running on a dual-stack socket sends IPv4-mapped IPv6 addresses:
      * "::ffff:203.0.113.42".  Strip the prefix so inet_addr() can parse it.
      * This is the BBSFirewall case — Mark's proxy-protocol.js strips it on the
@@ -622,7 +842,7 @@ parse_proxy_v1(INT skt, struct in_addr *out_ip)
         trueip_log("TRUEIP: stripped ::ffff: prefix, real src_ip='%s'", ip_ptr);
     }
 
-    /* -- Step 7: inet_addr conversion ------------------------------------
+    /* -- Step 10: inet_addr conversion -----------------------------------
      * inet_addr() returns INADDR_NONE (0xFFFFFFFF) for malformed input.
      * The TCPIP.H header redefines INADDR_NONE to 0xFFFFFFFFL to avoid a
      * Borland compiler warning — use that constant. */
@@ -742,9 +962,9 @@ trueip_incall(INT gotchn)
         return;
     }
 
-    /* -- Parse PROXY v1 header -----------------------------------------*/
+    /* -- Parse PROXY header (v1 text or v2 binary) --------------------*/
     memset(&real_ip, 0, sizeof(real_ip));
-    parse_rc = parse_proxy_v1(clskt, &real_ip);
+    parse_rc = parse_proxy_header(clskt, &real_ip);
 
     if (parse_rc < 0) {
         /* Malformed header, recv error, or unsupported protocol.

@@ -1,6 +1,6 @@
 # TRUEIP — Real Client IPs for MBBS10
 
-When MBBS10 sits behind a reverse proxy, all users appear to connect from the proxy's IP. TRUEIP fixes this by reading the [PROXY Protocol v1](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt) header that the proxy prepends, extracting the real client IP, and patching it into the BBS session.
+When MBBS10 sits behind a reverse proxy, all users appear to connect from the proxy's IP. TRUEIP fixes this by reading the [PROXY Protocol v1 or v2](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt) header that the proxy prepends, extracting the real client IP, and patching it into the BBS session.
 
 Every existing IP consumer — sysop WHO, audit trail, IP bans — transparently sees the real IP. No changes to any other module.
 
@@ -17,9 +17,10 @@ Reverse Proxy (BBSFirewall / HAProxy / nginx)
         |
         v
 TRUEIP (port 2324 on BBS)
-  1. Reads PROXY header from raw socket
-  2. Hands socket to telnet daemon (tntincall)
-  3. Overwrites tcpipinf[usrnum].inaddr = real IP
+  1. Auto-detects v1 (text) vs v2 (binary) from first bytes
+  2. Reads and parses the PROXY header
+  3. Hands socket to telnet daemon (tntincall)
+  4. Overwrites tcpipinf[usrnum].inaddr = real IP
         |
         v
 BBS session sees 203.0.113.42, not 192.168.1.1
@@ -52,9 +53,11 @@ BACKEND_PORT=2324
 
 **HAProxy**:
 ```
+# v1 text format
 server bbs 192.168.1.X:2324 send-proxy
+# v2 binary format (also supported)
+server bbs 192.168.1.X:2324 send-proxy-v2
 ```
-Note: `send-proxy`, NOT `send-proxy-v2` — only v1 text format is supported.
 
 **nginx stream**:
 ```
@@ -94,8 +97,7 @@ Interactive session (fakes a proxy connection):
 
 ## Limitations
 
-- PROXY Protocol v1 only (not v2 binary format)
-- IPv4 only (TCP6 headers are rejected)
+- IPv4 only (TCP6 headers are rejected by both v1 and v2 parsers)
 - Config changes require BBS restart
 - `hostdeny` IP blocking happens before TRUEIP sees the connection — per-client blocking must be done at the proxy layer
 

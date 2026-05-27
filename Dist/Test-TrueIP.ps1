@@ -1,14 +1,18 @@
 ﻿<#
 .SYNOPSIS
-    TRUEIP Proxy Protocol v1 Validation Script
+    TRUEIP Proxy Protocol v1 and v2 Validation Script
 
 .DESCRIPTION
-    Tests PROXY Protocol v1 behavior against a running MBBS10 BBS with TRUEIP installed.
-    Exercises four scenarios:
-      1. Valid PROXY TCP4 header  -- expects BBS login prompt
-      2. No PROXY header          -- expects rejection if require_header=YES
-      3. Malformed PROXY header   -- expects rejection
-      4. PROXY LOCAL              -- expects rejection or INFO depending on config
+    Tests PROXY Protocol v1 and v2 behavior against a running MBBS10 BBS with TRUEIP installed.
+    Exercises eight scenarios:
+      1. Valid PROXY TCP4 header (v1)          -- expects BBS login prompt
+      2. No PROXY header                       -- expects rejection if require_header=YES
+      3. Malformed PROXY header (v1)           -- expects rejection
+      4. PROXY LOCAL (v1)                      -- expects rejection or INFO depending on config
+      5. PROXY v2 TCP4 binary header           -- expects BBS login prompt
+      6. PROXY v2 LOCAL (health check)         -- expects rejection
+      7. PROXY v2 TCP6 (unsupported family)    -- expects rejection
+      8. PROXY v2 TCP4 with TLV extensions     -- expects BBS login prompt (TLVs ignored)
 
     Check the Windows Event Log after running:
       Get-WinEvent -FilterHashtable @{ProviderName='TRUEIP'} -MaxEvents 10
@@ -188,6 +192,178 @@ try {
     }
 } catch {
     Write-Host " PASS (connection refused)" -ForegroundColor Green
+}
+
+# ---------------------------------------------------------------------------
+# Helper: build a PROXY Protocol v2 magic prefix (12 bytes, constant)
+# ---------------------------------------------------------------------------
+function Get-ProxyV2Magic {
+    return [byte[]]@(0x0D,0x0A,0x0D,0x0A,0x00,0x0D,0x0A,0x51,0x55,0x49,0x54,0x0A)
+}
+
+# ---------------------------------------------------------------------------
+# Helper: convert a uint16 to 2-byte big-endian (network byte order)
+# ---------------------------------------------------------------------------
+function ConvertTo-NetworkUInt16 {
+    param([uint16]$Value)
+    $bytes = [BitConverter]::GetBytes($Value)
+    [Array]::Reverse($bytes)   # little-endian host → big-endian network
+    return $bytes
+}
+
+# ---------------------------------------------------------------------------
+# Test 5: PROXY v2 TCP4 binary header
+#   28-byte header: magic(12) + ver+cmd(1) + fam+proto(1) + addr_len(2)
+#                   + src_addr(4) + dst_addr(4) + src_port(2) + dst_port(2)
+#   Expects: BBS sends a login banner (n > 0 bytes)
+#   Sysop check: Event Log or LANCE should record IP as $FakeIp
+# ---------------------------------------------------------------------------
+Write-Host "[Test 5] PROXY v2 TCP4 binary header..." -NoNewline
+try {
+    $magic    = Get-ProxyV2Magic
+    $verCmd   = [byte]0x21                                              # version 2, command PROXY
+    $famProto = [byte]0x11                                              # AF_INET (1), STREAM (1)
+    $addrLen  = [byte[]]@(0x00, 0x0C)                                  # 12 bytes: 4+4+2+2
+    $srcAddr  = [System.Net.IPAddress]::Parse($FakeIp).GetAddressBytes()
+    $dstAddr  = [System.Net.IPAddress]::Parse("127.0.0.1").GetAddressBytes()
+    $srcPort  = ConvertTo-NetworkUInt16 -Value 54321
+    $dstPort  = ConvertTo-NetworkUInt16 -Value ([uint16]$Port)
+
+    $header5  = $magic + $verCmd + $famProto + $addrLen + $srcAddr + $dstAddr + $srcPort + $dstPort
+
+    ($c5, $s5) = New-TcpConnection -Host_ $BbsHost -Port_ $Port
+    $s5.Write($header5, 0, $header5.Length)   # raw bytes — do NOT use ASCII encoding
+
+    Start-Sleep -Milliseconds 1000
+
+    ($n5, $buf5) = Read-Response -Stream $s5
+    $c5.Close()
+
+    if ($n5 -gt 0) {
+        Write-Host " PASS ($n5 bytes received)" -ForegroundColor Green
+        Write-Host "  Sysop check: Event Log or LANCE should show source IP: $FakeIp"
+    } elseif ($n5 -eq 0) {
+        Write-Host " FAIL (connection closed immediately -- BBS may have rejected v2 header)" -ForegroundColor Red
+    } else {
+        Write-Host " FAIL (read timeout -- BBS did not respond)" -ForegroundColor Red
+    }
+} catch {
+    Write-Host " FAIL ($_)" -ForegroundColor Red
+}
+
+Write-Host ""
+
+# ---------------------------------------------------------------------------
+# Test 6: PROXY v2 LOCAL (health-check command)
+#   16-byte header: magic(12) + 0x20 (version 2, LOCAL) + 0x00 + addr_len 0x00,0x00
+#   No address payload follows.
+#   Expects: connection closed (TRUEIP rejects LOCAL command)
+# ---------------------------------------------------------------------------
+Write-Host "[Test 6] PROXY v2 LOCAL (health check)..." -NoNewline
+try {
+    $magic    = Get-ProxyV2Magic
+    $verCmd   = [byte]0x20   # version 2, command LOCAL
+    $famProto = [byte]0x00   # unspecified
+    $addrLen  = [byte[]]@(0x00, 0x00)
+
+    $header6  = $magic + $verCmd + $famProto + $addrLen
+
+    ($c6, $s6) = New-TcpConnection -Host_ $BbsHost -Port_ $Port -ReadTimeoutMs 3000
+    $s6.Write($header6, 0, $header6.Length)
+
+    Start-Sleep -Milliseconds 500
+
+    ($n6, $buf6) = Read-Response -Stream $s6
+    $c6.Close()
+
+    if ($n6 -eq 0) {
+        Write-Host " PASS (connection closed -- PROXY v2 LOCAL rejected)" -ForegroundColor Green
+    } elseif ($n6 -lt 0) {
+        Write-Host " PASS (read timed out -- likely rejected)" -ForegroundColor Green
+    } else {
+        Write-Host " WARN ($n6 bytes received -- expected rejection of LOCAL command)" -ForegroundColor Yellow
+    }
+} catch {
+    Write-Host " PASS (connection refused)" -ForegroundColor Green
+}
+
+Write-Host ""
+
+# ---------------------------------------------------------------------------
+# Test 7: PROXY v2 TCP6 (unsupported address family)
+#   Header: magic(12) + 0x21 (PROXY) + 0x21 (AF_INET6, STREAM) + addr_len(2) + 36 bytes of zeros
+#   addr_len for IPv6 block: 16(src)+16(dst)+2(srcport)+2(dstport) = 36 => 0x00,0x24
+#   Expects: connection closed (TRUEIP does not support TCP6)
+# ---------------------------------------------------------------------------
+Write-Host "[Test 7] PROXY v2 TCP6 (unsupported family)..." -NoNewline
+try {
+    $magic    = Get-ProxyV2Magic
+    $verCmd   = [byte]0x21   # version 2, command PROXY
+    $famProto = [byte]0x21   # AF_INET6 (2), STREAM (1)
+    $addrLen  = [byte[]]@(0x00, 0x24)   # 36 bytes of IPv6 address block
+    $addrData = [byte[]]::new(36)        # 36 zero bytes (any values acceptable per spec)
+
+    $header7  = $magic + $verCmd + $famProto + $addrLen + $addrData
+
+    ($c7, $s7) = New-TcpConnection -Host_ $BbsHost -Port_ $Port -ReadTimeoutMs 3000
+    $s7.Write($header7, 0, $header7.Length)
+
+    Start-Sleep -Milliseconds 500
+
+    ($n7, $buf7) = Read-Response -Stream $s7
+    $c7.Close()
+
+    if ($n7 -eq 0) {
+        Write-Host " PASS (connection closed -- TCP6 family rejected)" -ForegroundColor Green
+    } elseif ($n7 -lt 0) {
+        Write-Host " PASS (read timed out -- likely rejected)" -ForegroundColor Green
+    } else {
+        Write-Host " WARN ($n7 bytes received -- expected rejection of TCP6 family)" -ForegroundColor Yellow
+    }
+} catch {
+    Write-Host " PASS (connection refused)" -ForegroundColor Green
+}
+
+Write-Host ""
+
+# ---------------------------------------------------------------------------
+# Test 8: PROXY v2 TCP4 with TLV extensions (addr_len > 12)
+#   Header is identical to Test 5 except addr_len = 20 (12 addr bytes + 8 TLV bytes).
+#   BBS must consume all addr_len bytes before handing the socket to the telnet daemon,
+#   ignoring any trailing TLV data it does not recognise.
+#   Expects: PASS -- BBS login prompt received (TLVs silently ignored)
+# ---------------------------------------------------------------------------
+Write-Host "[Test 8] PROXY v2 TCP4 with TLV extensions..." -NoNewline
+try {
+    $magic    = Get-ProxyV2Magic
+    $verCmd   = [byte]0x21                                              # version 2, command PROXY
+    $famProto = [byte]0x11                                              # AF_INET (1), STREAM (1)
+    $addrLen  = [byte[]]@(0x00, 0x14)                                  # 20 = 12 addr + 8 TLV
+    $srcAddr  = [System.Net.IPAddress]::Parse($FakeIp).GetAddressBytes()
+    $dstAddr  = [System.Net.IPAddress]::Parse("127.0.0.1").GetAddressBytes()
+    $srcPort  = ConvertTo-NetworkUInt16 -Value 54321
+    $dstPort  = ConvertTo-NetworkUInt16 -Value ([uint16]$Port)
+    $tlvData  = [byte[]]@(0x01,0x00,0x04,0xDE,0xAD,0xBE,0xEF,0x00)    # 8 bytes dummy TLV
+
+    $header8  = $magic + $verCmd + $famProto + $addrLen + $srcAddr + $dstAddr + $srcPort + $dstPort + $tlvData
+
+    ($c8, $s8) = New-TcpConnection -Host_ $BbsHost -Port_ $Port
+    $s8.Write($header8, 0, $header8.Length)   # raw bytes
+
+    Start-Sleep -Milliseconds 1000
+
+    ($n8, $buf8) = Read-Response -Stream $s8
+    $c8.Close()
+
+    if ($n8 -gt 0) {
+        Write-Host " PASS ($n8 bytes received -- TLV extensions correctly ignored)" -ForegroundColor Green
+    } elseif ($n8 -eq 0) {
+        Write-Host " FAIL (connection closed -- BBS may not be consuming full addr_len)" -ForegroundColor Red
+    } else {
+        Write-Host " FAIL (read timeout -- BBS did not respond)" -ForegroundColor Red
+    }
+} catch {
+    Write-Host " FAIL ($_)" -ForegroundColor Red
 }
 
 Write-Host ""

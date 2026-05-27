@@ -1,5 +1,5 @@
 /*
- * trueip_core.h -- PROXY Protocol v1 shared core: structs, constants, prototypes
+ * trueip_core.h -- PROXY Protocol v1/v2 shared core: structs, constants, prototypes
  *
  * Purpose:
  *   Defines all types and function prototypes used by both the TRUEIP MBBS10
@@ -78,6 +78,25 @@
  * with room for future CIDR notation or IPv6 literals if policy changes.
  */
 #define TRUEIP_TRUSTED_LEN  64
+
+/*
+ * PROXY_V2_ADDR_LEN_CAP -- maximum address-length field value we will accept
+ * from a PROXY Protocol v2 header.
+ *
+ * The spec permits up to 65535 bytes of additional data after the fixed
+ * 16-byte v2 preamble.  We cap at 512 bytes to protect against malformed
+ * or malicious headers that could exhaust our stack/read loop budget.
+ * Any v2 header with addr_len > 512 is rejected with return -1.
+ */
+#define PROXY_V2_ADDR_LEN_CAP  512
+
+/*
+ * TRUEIP_V2_MAGIC -- the 12-byte PROXY Protocol v2 binary signature.
+ *
+ * Declared extern here; defined once in trueip_core.c.  Every translation
+ * unit that includes this header can reference the array without ODR issues.
+ */
+extern const unsigned char TRUEIP_V2_MAGIC[12];
 
 
 /* ===========================================================================
@@ -183,26 +202,44 @@ struct trueip_rate {
  * ========================================================================= */
 
 /*
- * trueip_parse_proxy_v1 -- read and parse a PROXY Protocol v1 header.
+ * trueip_parse_proxy_header -- read and parse a PROXY Protocol v1 or v2 header.
  *
- * Design decisions:
+ * Design decisions (common to both versions):
  *   - Uses ioctlsocket(FIONREAD) as a preflight check before reading.  This
  *     avoids blocking on a socket that has no data yet, which would stall the
  *     caller's thread.  It does NOT call recvbw (the Worldgroup buffered-recv
  *     helper) because this header must remain SDK-free and because recvbw
  *     manages its own buffer state that would corrupt the stream if called
  *     before the PROXY header is fully consumed.
- *   - Reads one byte at a time (recv with len=1) up to TRUEIP_MAX_HEADER bytes
- *     until \r\n is found.  Single-byte reads are slightly slower but
- *     eliminate the need for a secondary buffer or ungetting bytes — the
- *     remaining stream bytes stay in the kernel socket buffer, intact, ready
- *     for the next recv call (e.g., the game's normal input handler).
+ *   - Reads the first 16 bytes into a fixed buffer to detect the protocol
+ *     version before dispatching to the appropriate parse path.
+ *
+ * Protocol v1 specifics:
+ *   - After reading the first 16 bytes, continues byte-at-a-time until \r\n.
  *   - Strips the "::ffff:" IPv4-mapped IPv6 prefix so that proxies that emit
  *     TCP4-over-TCP6 addresses ("::ffff:1.2.3.4") produce a clean in_addr.
  *   - "PROXY LOCAL" health-check lines are treated as "no real client IP"
  *     (return 0) rather than an error, so load-balancer keepalives do not
  *     fill the event log with warnings.
  *   - TCP6 addresses are rejected with return -1.  The module is IPv4-only.
+ *
+ * Protocol v2 specifics:
+ *   - Detected by matching the first 12 bytes against TRUEIP_V2_MAGIC.
+ *   - Extracts version/command, family/transport, addr_len, and src_addr from
+ *     the fixed 16-byte binary preamble.
+ *   - addr_len is capped at PROXY_V2_ADDR_LEN_CAP (512) to limit read budget.
+ *   - The remaining addr_len bytes are read and discarded so the caller's next
+ *     recv() sees only application data.
+ *   - Only AF_INET/STREAM (family=0x11) is supported; other families return -1.
+ *
+ * Byte-consumption note:
+ *   This function always reads exactly 16 bytes before determining the version.
+ *   For v1, those 16 bytes include the start of the text header, which is then
+ *   continued byte-at-a-time.  For v2, those 16 bytes ARE the complete preamble.
+ *   If detection fails (neither v1 nor v2 signature matched), the 16 consumed
+ *   bytes are unrecoverable — same tradeoff as the original v1-only design.
+ *   This is documented as acceptable: a well-configured proxy always leads with
+ *   a recognisable header.
  *
  * Parameters:
  *   sock         -- connected client socket (must be valid and readable)
@@ -214,15 +251,16 @@ struct trueip_rate {
  *    1  header parsed successfully; *real_ip_out contains the client IP
  *    0  no PROXY header present, or "PROXY LOCAL" health check; caller should
  *       use the socket's own source address and proceed normally
- *   -1  malformed header, unsupported family (TCP6), or recv error; caller
- *       should close the socket and increment conn_rejected_header
+ *   -1  malformed header, unsupported family (TCP6/non-INET), recv error, or
+ *       addr_len exceeds cap; caller should close the socket and increment
+ *       conn_rejected_header
  *
  * Side effects:
  *   - Consumes exactly the PROXY header bytes from the socket receive buffer.
  *   - Does NOT modify the socket's blocking mode.
  *   - Does NOT close the socket on error — caller decides whether to close.
  */
-int trueip_parse_proxy_v1(SOCKET sock, struct in_addr *real_ip_out);
+int trueip_parse_proxy_header(SOCKET sock, struct in_addr *real_ip_out);
 
 /*
  * trueip_check_trusted -- verify that a source IP is authorised to supply

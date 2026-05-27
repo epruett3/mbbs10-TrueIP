@@ -1,8 +1,8 @@
 /*
- * trueip_core.c -- Shared PROXY Protocol v1 Core Implementation
+ * trueip_core.c -- Shared PROXY Protocol v1/v2 Core Implementation
  *
  * PURPOSE:
- *   Pure C implementation of the PROXY Protocol v1 parsing, trusted-IP
+ *   Pure C implementation of PROXY Protocol v1 and v2 parsing, trusted-IP
  *   checking, rate limiting, config parsing, event logging, and IP formatting
  *   primitives shared by both the standalone TRUEIP MBBS10 module and the
  *   GALTCPIP clone integration layer.
@@ -35,56 +35,79 @@
 #include "trueip_core.h"    /* struct trueip_config, struct trueip_rate, prototypes */
 
 #include <stdio.h>          /* _snprintf, _vsnprintf                            */
-#include <string.h>         /* strncmp, strncpy, sscanf, strlen                 */
+#include <string.h>         /* strncmp, strncpy, sscanf, strlen, memcmp, memcpy */
 #include <stdarg.h>         /* va_list, va_start, va_end                        */
 #include <stdlib.h>         /* (reserved; included for completeness)            */
 
 /* ---------------------------------------------------------------------------
- * trueip_parse_proxy_v1
+ * TRUEIP_V2_MAGIC -- PROXY Protocol v2 binary signature (12 bytes).
  *
- * Read and parse a PROXY Protocol v1 header from an already-accepted socket.
+ * Per the HAProxy PROXY Protocol specification v2, every v2 header begins
+ * with this exact sequence:
+ *   \r\n\r\n\0\r\nQUIT\n
+ *   0x0D 0x0A 0x0D 0x0A 0x00 0x0D 0x0A 0x51 0x55 0x49 0x54 0x0A
+ *
+ * The sequence was deliberately chosen to be:
+ *   - Invalid as a PROXY v1 header (does not start with "PROXY ")
+ *   - Invalid as a plain-text HTTP or telnet header
+ *   - Unlikely to appear at the start of any legitimate application stream
+ *
+ * The extern declaration is in trueip_core.h; this is the single definition.
+ * --------------------------------------------------------------------------*/
+const unsigned char TRUEIP_V2_MAGIC[12] = {
+    0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A
+};
+
+/* ---------------------------------------------------------------------------
+ * trueip_parse_proxy_header
+ *
+ * Read and parse a PROXY Protocol v1 or v2 header from an already-accepted
+ * socket.  Supersedes the original trueip_parse_proxy_v1.
  *
  * ALGORITHM OVERVIEW:
- *   1. Preflight via ioctlsocket(FIONREAD): if fewer than 6 bytes are in the
+ *   1. Preflight via ioctlsocket(FIONREAD): if fewer than 16 bytes are in the
  *      kernel receive buffer, return -1 immediately.  We do NOT block and do
  *      NOT call select().  The BBS scheduler is single-threaded; any blocking
  *      call in an incall handler stalls every other BBS user.
+ *      NOTE: raised from 6 → 16 to satisfy both v1 ("PROXY " = 6 chars) and
+ *      v2 (16-byte fixed preamble) with a single read; 16 is the tighter bound.
  *
- *   2. Receive one byte at a time until \r\n is found or the 107-byte limit
- *      is reached.  recv() returns immediately from the kernel buffer because
- *      FIONREAD confirmed bytes are present.  Byte-at-a-time avoids consuming
- *      post-header bytes (telnet IAC negotiation) that GALTNTD needs to read.
+ *   2. Read exactly 16 bytes into preamble[].  These bytes let us identify the
+ *      protocol version before committing to either parse path.
  *
- *   3. Null-terminate and strip the trailing \r\n.
+ *   3a. If the first 12 bytes match TRUEIP_V2_MAGIC → v2 binary parse path.
+ *   3b. If the first 6 bytes are "PROXY " → v1 text parse path (preamble[6..15]
+ *       are prepended into the line buffer to resume byte-at-a-time parsing).
+ *   3c. Otherwise → return 0 (unrecognised; caller decides via require_header).
  *
- *   4. Check the "PROXY " prefix (6 bytes).  If absent, return 0 (direct
- *      connection — no bytes have been consumed at this point... actually
- *      bytes HAVE been consumed up to where the prefix mismatch was detected.
- *      See NOTE below on the direct-connection case).
+ * V2 BINARY PATH:
+ *   preamble[12]   -- version_command byte: top nibble must be 0x2 (v2).
+ *                     Bottom nibble: 0x0=LOCAL, 0x1=PROXY.  LOCAL → return 0.
+ *   preamble[13]   -- family_transport byte: 0x11 = AF_INET/STREAM.
+ *                     Any other value (IPv6, Unix, UNSPEC) → return -1.
+ *   preamble[14..15] -- addr_len (big-endian uint16).  Extracted via memcpy
+ *                     to avoid strict-aliasing UB.  Capped at
+ *                     PROXY_V2_ADDR_LEN_CAP; larger values → return -1.
+ *                     For AF_INET/STREAM the spec mandates addr_len >= 12
+ *                     (4+4 addr + 2+2 port); shorter → return -1.
+ *   preamble[16..19] -- src IPv4 address (4 bytes), extracted via memcpy.
+ *   Remaining (addr_len - 4) bytes starting at offset 20: read and discard
+ *   so the post-header stream is clean for the caller.
+ *   NOTE: preamble[] only holds 16 bytes.  The src_addr is at preamble[16],
+ *   so the first 4 addr bytes are NOT in preamble[] — they are in a separate
+ *   single-call recv of addr_len bytes into a stack buffer.
  *
- *   5. sscanf parse into proto/src_ip/dst_ip/src_port/dst_port.
- *      Require exactly 5 fields for TCP4; fewer means LOCAL or malformed.
+ * V1 TEXT PATH:
+ *   The 16 bytes already consumed are the start of the text header.  We copy
+ *   them into line[] and continue byte-at-a-time until \r\n, then parse with
+ *   sscanf exactly as before.  The algorithm is otherwise identical to the
+ *   original trueip_parse_proxy_v1.
  *
- *   6. "LOCAL" (1 field) → return 0 (HAProxy health check, no IP substitution).
- *      Non-TCP4 → return -1 (TCP6 unsupported; tcpipinf.inaddr is 32-bit only).
- *
- *   7. Strip "::ffff:" prefix from src_ip if present.  Node.js dual-stack
- *      sockets send IPv4-mapped IPv6 addresses ("::ffff:203.0.113.42").
- *      Stripping the prefix produces a standard dotted-decimal string that
- *      inet_addr() can parse.
- *
- *   8. inet_addr() conversion.  INADDR_NONE (0xFFFFFFFF) → malformed → -1.
- *
- *   9. Store in *real_ip_out, return 1.
- *
- * NOTE on step 4 and byte consumption:
- *   In the byte-at-a-time approach, bytes are consumed from the kernel buffer
- *   as we read.  If the prefix does not match (return 0 case), those bytes are
- *   already gone.  Callers that pass require_header=NO in the direct-connection
- *   path should be aware of this.  The MSG_PEEK approach in trueip.c avoids
- *   this by peeking first, but this core function uses byte-at-a-time per the
- *   spec.  In practice, a valid PROXY-protocol endpoint always sends the header,
- *   so the return-0 case here is only the PROXY LOCAL health-check path.
+ * BYTE CONSUMPTION NOTE:
+ *   16 bytes are always consumed before version detection.  If neither magic
+ *   is matched, those bytes are gone — same tradeoff as the original v1-only
+ *   design where up to 6 bytes were consumed.  Documented and acceptable per
+ *   spec: a well-behaved proxy always leads with a recognisable header.
  *
  * PARAMETERS:
  *   sock        -- the accepted socket (not yet handed to GALTNTD)
@@ -92,16 +115,22 @@
  *
  * RETURNS:
  *    1  -- success; *real_ip_out is valid
- *    0  -- no PROXY header / PROXY LOCAL health check
- *   -1  -- recv error, malformed header, unsupported protocol
+ *    0  -- no PROXY header / PROXY LOCAL health check / v2 LOCAL command
+ *   -1  -- recv error, malformed header, unsupported family, addr_len > cap
  * --------------------------------------------------------------------------*/
 int
-trueip_parse_proxy_v1(SOCKET sock, struct in_addr *real_ip_out)
+trueip_parse_proxy_header(SOCKET sock, struct in_addr *real_ip_out)
 {
+    /* Fixed 16-byte preamble: covers the complete v2 header or the first 16
+     * bytes of a v1 text header (which we continue byte-at-a-time). */
+    unsigned char   preamble[16];
+    int             rc;
+    int             i;
+
+    /* V1 text-parse state — reused after copying preamble into line[]. */
     char        line[TRUEIP_MAX_HEADER + 1]; /* header max + NUL terminator     */
     int         len = 0;
     char        ch;
-    int         rc;
 
     char        proto[16]   = {0};
     char        src_ip[64]  = {0};
@@ -120,6 +149,11 @@ trueip_parse_proxy_v1(SOCKET sock, struct in_addr *real_ip_out)
      *   there is no GALTCPIP table; we call ioctlsocket directly instead.
      *   Both ultimately interrogate the kernel buffer — the result is identical.
      *
+     * WHY 16 bytes (raised from 6):
+     *   The v2 fixed preamble is exactly 16 bytes.  We always read 16 bytes
+     *   upfront so we can detect either protocol in one recv() call.  16 is
+     *   also more than sufficient to detect a v1 header ("PROXY " = 6 bytes).
+     *
      * WHY NOT select() or blocking recv():
      *   The BBS scheduler is single-threaded.  Blocking here stalls every other
      *   user on the BBS until the proxy sends the header.  A well-behaved proxy
@@ -131,17 +165,157 @@ trueip_parse_proxy_v1(SOCKET sock, struct in_addr *real_ip_out)
         if (ioctlsocket(sock, FIONREAD, &avail) == SOCKET_ERROR) {
             return -1;
         }
-        if (avail < 6) {
-            /* Fewer than 6 bytes in the buffer — cannot be a PROXY header.
-             * 6 is the minimum to distinguish "PROXY " from telnet IAC or
-             * a raw data connection. */
+        if (avail < 16) {
+            /* Fewer than 16 bytes in the buffer — cannot be a v2 header, and
+             * not enough to safely read a preamble for v1 detection.  Reject. */
             return -1;
         }
     }
 
-    /* -- Step 2: read byte-at-a-time until \r\n or max length -------------
+    /* -- Step 2: read exactly 16 bytes into preamble[] --------------------
      *
-     * We stop at PROXY_HEADER_MAX (107) bytes per the PROXY Protocol v1 spec.
+     * We use a single recv() with MSG_WAITALL semantics via a loop rather than
+     * relying on MSG_WAITALL (not universally supported on Winsock for TCP).
+     * FIONREAD confirmed at least 16 bytes are present, so each recv() call
+     * returns immediately from the kernel buffer without blocking. */
+    {
+        int total = 0;
+        while (total < 16) {
+            rc = recv(sock, (char *)preamble + total, 16 - total, 0);
+            if (rc <= 0) {
+                /* Socket error or connection closed before 16 bytes arrived. */
+                return -1;
+            }
+            total += rc;
+        }
+    }
+
+    /* -- Step 3a: check for PROXY Protocol v2 magic -----------------------
+     *
+     * The first 12 bytes of every v2 header are TRUEIP_V2_MAGIC.  memcmp is
+     * the correct tool here: it does a constant-time byte comparison with no
+     * strict-aliasing concerns. */
+    if (memcmp(preamble, TRUEIP_V2_MAGIC, 12) == 0) {
+
+        /* ---- V2 BINARY PARSE PATH ---- */
+        unsigned char   ver_cmd;       /* preamble[12]: version | command      */
+        unsigned char   fam_trans;     /* preamble[13]: family | transport     */
+        unsigned short  addr_len_net;  /* preamble[14..15]: big-endian length  */
+        unsigned short  addr_len;      /* host-byte-order addr_len             */
+        unsigned char   addr_buf[PROXY_V2_ADDR_LEN_CAP]; /* discard buffer    */
+
+        ver_cmd   = preamble[12];
+        fam_trans = preamble[13];
+
+        /* Extract addr_len via memcpy to avoid strict-aliasing UB.
+         * The field is big-endian (network byte order) per the v2 spec. */
+        memcpy(&addr_len_net, preamble + 14, 2);
+        addr_len = ntohs(addr_len_net);
+
+        /* Check version nibble: must be 0x2 (v2).  0x1 would be v1 — should
+         * never appear here since the magic already differentiates them. */
+        if ((ver_cmd >> 4) != 0x2) {
+            /* Unrecognised version in v2 preamble — reject. */
+            return -1;
+        }
+
+        /* Command nibble: 0x0 = LOCAL (health check), 0x1 = PROXY (real conn). */
+        if ((ver_cmd & 0x0F) == 0x00) {
+            /* LOCAL command: health check.  No IP substitution.  Read and
+             * discard the addr_len payload bytes to leave the stream clean,
+             * then return 0 so the caller uses the socket's own source addr. */
+            if (addr_len > 0) {
+                if (addr_len > PROXY_V2_ADDR_LEN_CAP) {
+                    /* Implausibly large LOCAL payload — reject. */
+                    return -1;
+                }
+                {
+                    int discarded = 0;
+                    while (discarded < (int)addr_len) {
+                        rc = recv(sock, (char *)addr_buf + discarded,
+                                  (int)addr_len - discarded, 0);
+                        if (rc <= 0) {
+                            return -1;
+                        }
+                        discarded += rc;
+                    }
+                }
+            }
+            return 0;   /* PROXY LOCAL — caller uses socket source address */
+        }
+
+        if ((ver_cmd & 0x0F) != 0x01) {
+            /* Unknown command — reject rather than guess intent. */
+            return -1;
+        }
+
+        /* Family/transport: 0x11 = AF_INET (0x1) + SOCK_STREAM (0x1).
+         * We are IPv4-only; AF_INET6 (0x21), AF_UNIX (0x31), UNSPEC (0x00)
+         * are all rejected. */
+        if (fam_trans != 0x11) {
+            /* Unsupported address family or transport in v2 header — reject. */
+            return -1;
+        }
+
+        /* For AF_INET/STREAM the spec requires addr_len >= 12:
+         *   4 bytes src IPv4 + 4 bytes dst IPv4 + 2 bytes src port + 2 bytes dst port
+         * Fewer bytes means the header is truncated. */
+        if (addr_len < 12) {
+            /* Truncated v2 address block — reject. */
+            return -1;
+        }
+
+        /* Guard against malformed or malicious headers with oversized addr_len. */
+        if (addr_len > PROXY_V2_ADDR_LEN_CAP) {
+            /* addr_len exceeds PROXY_V2_ADDR_LEN_CAP — reject. */
+            return -1;
+        }
+
+        /* Read addr_len bytes: [0..3]=src_addr [4..7]=dst_addr [8..9]=src_port
+         * [10..11]=dst_port [12+]=optional TLVs.  We only need bytes [0..3]. */
+        {
+            int got = 0;
+            while (got < (int)addr_len) {
+                rc = recv(sock, (char *)addr_buf + got,
+                          (int)addr_len - got, 0);
+                if (rc <= 0) {
+                    /* Socket error while reading v2 address block. */
+                    return -1;
+                }
+                got += rc;
+            }
+        }
+
+        /* Extract source IPv4 from the first 4 bytes of addr_buf.
+         * memcpy avoids strict-aliasing UB when copying into s_addr (uint32). */
+        memcpy(&real_ip_out->s_addr, addr_buf, 4);
+        return 1;
+    }
+
+    /* -- Step 3b: check for PROXY Protocol v1 text prefix -----------------
+     *
+     * The 16 bytes already in preamble[] are the start of a v1 text header.
+     * Copy them into line[] and continue reading byte-at-a-time until \r\n,
+     * exactly as the original trueip_parse_proxy_v1 did. */
+    if (memcmp(preamble, "PROXY ", 6) != 0) {
+        /* First 6 bytes are neither the v2 magic nor "PROXY " — unrecognised
+         * connection.  The 16 bytes are already consumed and unrecoverable.
+         * Return 0; caller decides based on require_header. */
+        return 0;
+    }
+
+    /* ---- V1 TEXT PARSE PATH ---- */
+
+    /* Seed line[] with the 16 bytes already read from the socket.  These are
+     * the first characters of the text header; we continue from byte 16. */
+    for (i = 0; i < 16; i++) {
+        line[i] = (char)preamble[i];
+    }
+    len = 16;
+
+    /* Continue byte-at-a-time until \r\n or the 107-byte ceiling.
+     *
+     * We stop at TRUEIP_MAX_HEADER (107) bytes per the PROXY Protocol v1 spec.
      * The longest valid header is:
      *   "PROXY TCP4 255.255.255.255 255.255.255.255 65535 65535\r\n" = 56 bytes
      * The TCP6 variant is longer; 107 covers it per the RFC.
@@ -167,24 +341,16 @@ trueip_parse_proxy_v1(SOCKET sock, struct in_addr *real_ip_out)
         return -1;
     }
 
-    /* -- Step 3: NUL-terminate (already done in the loop above) ----------- */
+    /* NUL-terminate (already done in the loop above for the \r\n case). */
 
-    /* -- Step 4: check the "PROXY " prefix (6 bytes) ---------------------- */
-    if (strncmp(line, "PROXY ", 6) != 0) {
-        /* The first 6 bytes are not "PROXY " — this is not a PROXY Protocol
-         * connection.  Return 0 so the caller can decide based on require_header. */
-        return 0;
-    }
-
-    /* -- Step 5: sscanf parse --------------------------------------------- */
+    /* sscanf parse into the five v1 fields. */
     fields = sscanf(line, "PROXY %15s %63s %63s %d %d",
                     proto, src_ip, dst_ip, &src_port, &dst_port);
 
-    /* -- Step 6: check protocol field ------------------------------------- */
+    /* "PROXY LOCAL" is an HAProxy health-check "connection".  The spec says
+     * the receiver must ignore it and not perform IP substitution.
+     * Return 0 so the caller knows no real-IP was extracted. */
     if (fields >= 1 && strncmp(proto, "LOCAL", 5) == 0) {
-        /* PROXY LOCAL is an HAProxy health-check "connection".  The spec says
-         * the receiver must ignore it and not perform IP substitution.
-         * Return 0 so the caller knows no real-IP was extracted. */
         return 0;
     }
 
@@ -200,7 +366,7 @@ trueip_parse_proxy_v1(SOCKET sock, struct in_addr *real_ip_out)
         return -1;
     }
 
-    /* -- Step 7: strip "::ffff:" IPv4-mapped IPv6 prefix ------------------
+    /* Strip "::ffff:" IPv4-mapped IPv6 prefix.
      *
      * Node.js running on a dual-stack socket (and some other proxies) sends
      * the source IP as "::ffff:203.0.113.42" instead of "203.0.113.42".
@@ -211,7 +377,7 @@ trueip_parse_proxy_v1(SOCKET sock, struct in_addr *real_ip_out)
         ip_ptr += 7;
     }
 
-    /* -- Step 8: convert dotted-decimal to binary network address --------- */
+    /* Convert dotted-decimal to binary network address. */
     addr = inet_addr(ip_ptr);
     if (addr == INADDR_NONE) {
         /* INADDR_NONE means inet_addr() could not parse the string.
@@ -220,7 +386,7 @@ trueip_parse_proxy_v1(SOCKET sock, struct in_addr *real_ip_out)
         return -1;
     }
 
-    /* -- Step 9: store result and return success -------------------------- */
+    /* Store result and return success. */
     real_ip_out->s_addr = addr;
     return 1;
 }
